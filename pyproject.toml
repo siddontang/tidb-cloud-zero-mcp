@@ -1,0 +1,10 @@
+[project]
+name = "tidb-cloud-zero-mcp"
+version = "0.1.0"
+description = "MCP server that gives AI agents a persistent MySQL database via TiDB Cloud Zero"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "mcp[cli]>=1.26.0",
+    "pymysql>=1.1.2",
+]
