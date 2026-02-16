@@ -4,23 +4,25 @@ Give any AI agent a persistent MySQL database through the [Model Context Protoco
 
 Built on [TiDB Cloud Zero](https://zero.tidbcloud.com) — free serverless MySQL that's perfect for AI agents.
 
-## What is this?
+**Pure HTTP** — no MySQL drivers, no persistent connections, no sockets. Uses the [TiDB Serverless HTTP API](https://github.com/tidbcloud/serverless-js) (`POST /v1beta/sql`), making it compatible with edge runtimes, serverless functions, and any environment that can make HTTPS requests.
 
-An MCP server that connects AI agents (Claude, Cursor, Windsurf, OpenAI, etc.) to a TiDB Cloud Zero database. Agents can create tables, run queries, analyze data — all through the standard MCP protocol.
+## How It Works
 
 ```
-┌─────────────┐     MCP      ┌──────────────┐     MySQL     ┌─────────────────┐
-│  AI Agent   │◄────────────►│  MCP Server  │◄─────────────►│ TiDB Cloud Zero │
-│  (Claude,   │   stdio/http │  (this repo) │   port 4000   │  (free MySQL)   │
-│   Cursor)   │              │              │               │                 │
-└─────────────┘              └──────────────┘               └─────────────────┘
+┌─────────────┐     MCP      ┌──────────────┐    HTTPS     ┌─────────────────┐
+│  AI Agent   │◄────────────►│  MCP Server  │◄────────────►│ TiDB Cloud Zero │
+│  (Claude,   │   stdio/http │  (this repo) │  /v1beta/sql │  (free MySQL)   │
+│   Cursor)   │              │              │   pure HTTP  │                 │
+└─────────────┘              └──────────────┘              └─────────────────┘
 ```
+
+Each SQL query is a single HTTP POST — stateless, no connection pooling, no driver dependencies.
 
 ## Quick Start
 
 ### 1. Get a free TiDB Cloud Zero database
 
-Go to [zero.tidbcloud.com](https://zero.tidbcloud.com) and create a free database. Note your connection details (host, user, password).
+Go to [zero.tidbcloud.com](https://zero.tidbcloud.com) and create a free database. Note your connection URL.
 
 ### 2. Install and run
 
@@ -28,15 +30,20 @@ Go to [zero.tidbcloud.com](https://zero.tidbcloud.com) and create a free databas
 git clone https://github.com/siddontang/tidb-cloud-zero-mcp.git
 cd tidb-cloud-zero-mcp
 
-# Set your TiDB Cloud Zero credentials
-export TIDB_HOST="gateway01.us-west-2.prod.aws.tidbcloud.com"
-export TIDB_PORT=4000
-export TIDB_USER="your_user"
-export TIDB_PASSWORD="your_password"
-export TIDB_DATABASE="test"
+# Set your TiDB Cloud Zero connection URL
+export TIDB_URL="mysql://user:password@gateway01.us-west-2.prod.aws.tidbcloud.com/test"
 
 # Run the server
 uv run server.py
+```
+
+Or set individual environment variables:
+
+```bash
+export TIDB_HOST="gateway01.us-west-2.prod.aws.tidbcloud.com"
+export TIDB_USERNAME="your_user"
+export TIDB_PASSWORD="your_password"
+export TIDB_DATABASE="test"
 ```
 
 ### 3. Connect your AI agent
@@ -52,11 +59,7 @@ Add to your `claude_desktop_config.json`:
       "command": "uv",
       "args": ["run", "--project", "/path/to/tidb-cloud-zero-mcp", "server.py"],
       "env": {
-        "TIDB_HOST": "gateway01.us-west-2.prod.aws.tidbcloud.com",
-        "TIDB_PORT": "4000",
-        "TIDB_USER": "your_user",
-        "TIDB_PASSWORD": "your_password",
-        "TIDB_DATABASE": "test"
+        "TIDB_URL": "mysql://user:password@gateway01.us-west-2.prod.aws.tidbcloud.com/test"
       }
     }
   }
@@ -71,23 +74,7 @@ claude mcp add tidb -- uv run --project /path/to/tidb-cloud-zero-mcp server.py
 
 #### Cursor / Windsurf
 
-Add to your MCP settings:
-
-```json
-{
-  "tidb": {
-    "command": "uv",
-    "args": ["run", "--project", "/path/to/tidb-cloud-zero-mcp", "server.py"],
-    "env": {
-      "TIDB_HOST": "gateway01.us-west-2.prod.aws.tidbcloud.com",
-      "TIDB_PORT": "4000",
-      "TIDB_USER": "your_user",
-      "TIDB_PASSWORD": "your_password",
-      "TIDB_DATABASE": "test"
-    }
-  }
-}
-```
+Add to your MCP settings with the same `command`, `args`, and `env` as above.
 
 #### HTTP Transport (for web clients)
 
@@ -102,7 +89,7 @@ uv run server.py --transport http
 |------|-------------|
 | `query` | Run SELECT/SHOW/DESCRIBE/EXPLAIN queries |
 | `execute` | Run CREATE/INSERT/UPDATE/DELETE/ALTER statements |
-| `batch_insert` | Insert multiple rows efficiently |
+| `batch_execute` | Run multiple SQL statements sequentially |
 | `list_tables` | List all tables with row counts |
 | `describe_table` | Get table schema (columns, types, keys) |
 | `get_database_info` | Database info and TiDB version |
@@ -131,7 +118,27 @@ Once connected, you can ask your AI agent things like:
 - *"Write a query to find the top 10 customers by revenue"*
 - *"Create a schema for a todo app"*
 
-The agent will use the MCP tools to interact with your TiDB Cloud Zero database directly.
+The agent uses the MCP tools to interact with your TiDB Cloud Zero database directly.
+
+## Architecture
+
+Unlike traditional database MCP servers that use MySQL/Postgres wire protocol, this server uses TiDB's **Serverless HTTP API**:
+
+```python
+# Every query is just an HTTP POST
+POST https://http-{host}/v1beta/sql
+Authorization: Basic {base64(user:pass)}
+TiDB-Database: {database}
+Content-Type: application/json
+
+{"query": "SELECT * FROM users"}
+```
+
+This means:
+- **No MySQL driver** — works anywhere that can make HTTPS requests
+- **No connection management** — each query is independent
+- **Edge-compatible** — runs in serverless functions, edge workers, etc.
+- **Zero dependencies** — only `httpx` for HTTP and `mcp` for the protocol
 
 ## Why TiDB Cloud Zero?
 
@@ -140,6 +147,7 @@ The agent will use the MCP tools to interact with your TiDB Cloud Zero database 
 | **Free forever** | No credit card, no surprise bills |
 | **MySQL compatible** | Works with every tool, ORM, and language |
 | **Serverless** | No provisioning, no maintenance |
+| **HTTP API** | No drivers needed, works from edge/serverless |
 | **Scales to zero** | Only uses resources when you need them |
 | **Built-in HTAP** | OLTP + OLAP in one database |
 
@@ -152,8 +160,12 @@ uv sync
 # Run with MCP Inspector for testing
 uv run mcp dev server.py
 
-# Run tests
-uv run pytest
+# Test directly
+TIDB_URL="mysql://..." uv run python -c "
+import asyncio
+from server import get_database_info
+print(asyncio.run(get_database_info()))
+"
 ```
 
 ## License

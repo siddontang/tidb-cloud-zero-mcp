@@ -5,6 +5,6 @@ description = "MCP server that gives AI agents a persistent MySQL database via T
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "httpx>=0.28.1",
     "mcp[cli]>=1.26.0",
-    "pymysql>=1.1.2",
 ]
