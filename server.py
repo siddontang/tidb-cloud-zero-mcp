@@ -4,46 +4,98 @@ TiDB Cloud Zero MCP Server
 An MCP server that gives any AI agent (Claude, Cursor, Windsurf, etc.)
 a persistent MySQL database via TiDB Cloud Zero.
 
-Uses the TiDB Serverless HTTP API (no MySQL driver needed — pure HTTP).
-Zero dependencies beyond `mcp` and `httpx`.
+**Zero config** — on first use, the server automatically provisions a free
+TiDB Cloud Zero instance. No signup, no API keys, no credentials needed.
+
+Uses the TiDB Serverless HTTP API (pure HTTP, no MySQL driver).
 
 Usage:
     uv run server.py                    # stdio transport (for Claude Desktop)
     uv run server.py --transport http   # HTTP transport (for web clients)
 
-Configure via environment variables:
-    TIDB_HOST      - TiDB Cloud Zero host (e.g., gateway01.us-west-2.prod.aws.tidbcloud.com)
+Environment variables (all optional):
+    TIDB_URL       - mysql://user:password@host/database (skip auto-provisioning)
+    TIDB_HOST      - TiDB host (skip auto-provisioning)
     TIDB_USERNAME  - Database user
     TIDB_PASSWORD  - Database password
     TIDB_DATABASE  - Database name (default: test)
 
-Or use a connection URL:
-    TIDB_URL       - mysql://user:password@host/database
+If no credentials are provided, a TiDB Cloud Zero instance is created automatically.
 """
 
 import base64
 import json
 import os
-import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 
+# --- Constants ---
+ZERO_API = "https://zero.tidbapi.com/v1alpha1/instances"
+STATE_FILE = Path.home() / ".tidb-cloud-zero-mcp" / "instance.json"
+
+
 # --- Configuration ---
 
 @dataclass
 class TiDBConfig:
-    host: str
-    username: str
-    password: str
-    database: str
+    host: str = ""
+    username: str = ""
+    password: str = ""
+    database: str = "test"
+    expires_at: str = ""
+
+    @property
+    def api_url(self) -> str:
+        return f"https://http-{self.host}/v1beta/sql"
+
+    @property
+    def auth_header(self) -> str:
+        credentials = f"{self.username}:{self.password}"
+        return f"Basic {base64.b64encode(credentials.encode()).decode()}"
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.host and self.username and self.password)
+
+    @property
+    def is_expired(self) -> bool:
+        if not self.expires_at:
+            return False
+        try:
+            exp = datetime.fromisoformat(self.expires_at.replace("Z", "+00:00"))
+            return datetime.now(timezone.utc) >= exp
+        except Exception:
+            return False
+
+    def to_dict(self) -> dict:
+        return {
+            "host": self.host,
+            "username": self.username,
+            "password": self.password,
+            "database": self.database,
+            "expires_at": self.expires_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TiDBConfig":
+        return cls(
+            host=d.get("host", ""),
+            username=d.get("username", ""),
+            password=d.get("password", ""),
+            database=d.get("database", "test"),
+            expires_at=d.get("expires_at", ""),
+        )
 
     @classmethod
     def from_env(cls) -> "TiDBConfig":
+        """Load config from environment variables."""
         url = os.environ.get("TIDB_URL", "")
         if url:
             parsed = urlparse(url)
@@ -51,41 +103,100 @@ class TiDBConfig:
                 host=parsed.hostname or "",
                 username=unquote(parsed.username or ""),
                 password=unquote(parsed.password or ""),
-                database=unquote(parsed.path.lstrip("/")),
+                database=unquote(parsed.path.lstrip("/")) or "test",
             )
-        return cls(
-            host=os.environ.get("TIDB_HOST", ""),
-            username=os.environ.get("TIDB_USERNAME", ""),
-            password=os.environ.get("TIDB_PASSWORD", ""),
-            database=os.environ.get("TIDB_DATABASE", "test"),
-        )
+        host = os.environ.get("TIDB_HOST", "")
+        if host:
+            return cls(
+                host=host,
+                username=os.environ.get("TIDB_USERNAME", ""),
+                password=os.environ.get("TIDB_PASSWORD", ""),
+                database=os.environ.get("TIDB_DATABASE", "test"),
+            )
+        return cls()
 
-    @property
-    def api_url(self) -> str:
-        """TiDB Serverless HTTP API endpoint."""
-        return f"https://http-{self.host}/v1beta/sql"
+    @classmethod
+    def load_saved(cls) -> "TiDBConfig | None":
+        """Load saved instance from disk."""
+        if STATE_FILE.exists():
+            try:
+                data = json.loads(STATE_FILE.read_text())
+                config = cls.from_dict(data)
+                if config.is_configured and not config.is_expired:
+                    return config
+            except Exception:
+                pass
+        return None
 
-    @property
-    def auth_header(self) -> str:
-        """Basic auth header value."""
-        credentials = f"{self.username}:{self.password}"
-        return f"Basic {base64.b64encode(credentials.encode()).decode()}"
+    def save(self):
+        """Save instance to disk for reuse."""
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(self.to_dict(), indent=2))
 
 
-config = TiDBConfig.from_env()
+# --- Global config (lazy-initialized) ---
+_config: TiDBConfig | None = None
 
 
-# --- HTTP Client ---
+async def get_config() -> TiDBConfig:
+    """Get or create TiDB config. Auto-provisions a Zero instance if needed."""
+    global _config
+
+    if _config and _config.is_configured and not _config.is_expired:
+        return _config
+
+    # 1. Try environment variables
+    env_config = TiDBConfig.from_env()
+    if env_config.is_configured:
+        _config = env_config
+        return _config
+
+    # 2. Try saved instance
+    saved = TiDBConfig.load_saved()
+    if saved:
+        _config = saved
+        return _config
+
+    # 3. Auto-provision a new TiDB Cloud Zero instance
+    _config = await provision_zero_instance()
+    return _config
+
+
+async def provision_zero_instance() -> TiDBConfig:
+    """Create a new TiDB Cloud Zero instance via API."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(ZERO_API, timeout=30)
+
+    if resp.status_code != 200:
+        raise Exception(f"Failed to create TiDB Cloud Zero instance: {resp.status_code} {resp.text}")
+
+    data = resp.json()
+    instance = data["instance"]
+    conn = instance["connection"]
+
+    config = TiDBConfig(
+        host=conn["host"],
+        username=conn["username"],
+        password=conn["password"],
+        database="test",
+        expires_at=instance.get("expiresAt", ""),
+    )
+
+    # Save for reuse across restarts
+    config.save()
+    return config
+
+
+# --- HTTP SQL Client ---
 
 @dataclass
 class QueryResult:
-    columns: list[dict]  # [{name, type, nullable}]
+    columns: list[dict]
     rows: list[list[str]]
     rows_affected: int | None
     last_insert_id: str | None
 
     def to_dicts(self) -> list[dict]:
-        """Convert rows to list of dicts."""
         if not self.columns or not self.rows:
             return []
         return [
@@ -96,6 +207,7 @@ class QueryResult:
 
 async def execute_sql(sql: str, database: str | None = None) -> QueryResult:
     """Execute SQL via TiDB Serverless HTTP API."""
+    config = await get_config()
     db = database or config.database
     headers = {
         "Content-Type": "application/json",
@@ -126,7 +238,6 @@ async def execute_sql(sql: str, database: str | None = None) -> QueryResult:
 # --- Formatting ---
 
 def format_results(result: QueryResult, max_rows: int = 100) -> str:
-    """Format query results as a readable table."""
     rows = result.to_dicts()
     if not rows:
         if result.rows_affected is not None:
@@ -158,19 +269,6 @@ def format_results(result: QueryResult, max_rows: int = 100) -> str:
     return text
 
 
-def format_schema(result: QueryResult) -> str:
-    """Format with column type info."""
-    rows = result.to_dicts()
-    if not rows:
-        return "No results."
-    text = format_results(result)
-    # Add type info from column metadata
-    if result.columns:
-        type_info = ", ".join(f"{c['name']}({c['type']})" for c in result.columns)
-        text += f"\n\nColumn types: {type_info}"
-    return text
-
-
 # --- MCP Server ---
 
 mcp = FastMCP(
@@ -178,7 +276,7 @@ mcp = FastMCP(
     instructions="""You have access to a TiDB Cloud Zero MySQL database via HTTP API.
 Use the provided tools to create tables, insert data, run queries, and manage schema.
 TiDB is MySQL-compatible with distributed SQL support. Standard MySQL syntax works.
-The connection is serverless — no persistent connections, each query is independent.""",
+The database is auto-provisioned — no setup needed. Just start using it.""",
 )
 
 
@@ -187,19 +285,16 @@ async def query(sql: str) -> str:
     """Execute a read-only SQL query (SELECT, SHOW, DESCRIBE, EXPLAIN).
 
     Returns results as a formatted table.
-    Use this for reading data, inspecting schema, and exploring the database.
 
     Examples:
         query("SELECT * FROM users LIMIT 10")
         query("SHOW TABLES")
         query("DESCRIBE users")
-        query("EXPLAIN SELECT * FROM orders WHERE user_id = 1")
     """
     sql_upper = sql.strip().upper()
     allowed_prefixes = ("SELECT", "SHOW", "DESCRIBE", "DESC", "EXPLAIN")
     if not any(sql_upper.startswith(p) for p in allowed_prefixes):
         return "Error: query() only supports SELECT, SHOW, DESCRIBE, and EXPLAIN. Use execute() for write operations."
-
     try:
         result = await execute_sql(sql)
         return format_results(result)
@@ -211,14 +306,11 @@ async def query(sql: str) -> str:
 async def execute(sql: str) -> str:
     """Execute a write SQL statement (CREATE, INSERT, UPDATE, DELETE, ALTER, DROP).
 
-    Returns the number of affected rows or success message.
-    Use this for modifying data and schema.
+    Returns the number of affected rows.
 
     Examples:
-        execute("CREATE TABLE users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255), email VARCHAR(255))")
-        execute("INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com')")
-        execute("UPDATE users SET name = 'Bob' WHERE id = 1")
-        execute("ALTER TABLE users ADD COLUMN age INT")
+        execute("CREATE TABLE users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255))")
+        execute("INSERT INTO users (name) VALUES ('Alice')")
     """
     try:
         result = await execute_sql(sql)
@@ -234,9 +326,6 @@ async def execute(sql: str) -> str:
 async def batch_execute(statements: list[str]) -> str:
     """Execute multiple SQL statements sequentially.
 
-    Useful for running migrations, seeding data, or multi-step schema changes.
-    Each statement is executed independently (no transaction).
-
     Args:
         statements: List of SQL statements to execute in order
 
@@ -244,8 +333,7 @@ async def batch_execute(statements: list[str]) -> str:
         batch_execute([
             "CREATE TABLE users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255))",
             "INSERT INTO users (name) VALUES ('Alice')",
-            "INSERT INTO users (name) VALUES ('Bob')",
-            "CREATE INDEX idx_name ON users(name)"
+            "INSERT INTO users (name) VALUES ('Bob')"
         ])
     """
     results = []
@@ -279,7 +367,6 @@ async def list_tables() -> str:
                 count = "?"
             tables.append({"table": table_name, "rows": count})
 
-        # Format manually
         max_name = max(len(t["table"]) for t in tables)
         max_name = max(max_name, 5)
         lines = [f"{'table'.ljust(max_name)} | rows", f"{'-' * max_name}-+-----"]
@@ -306,8 +393,9 @@ async def describe_table(table: str) -> str:
 
 @mcp.tool()
 async def get_database_info() -> str:
-    """Get information about the current database connection and TiDB version."""
+    """Get database connection info, TiDB version, and instance status."""
     try:
+        config = await get_config()
         version_result = await execute_sql("SELECT VERSION() as version")
         version = version_result.rows[0][0] if version_result.rows else "unknown"
 
@@ -317,16 +405,21 @@ async def get_database_info() -> str:
         tables_result = await execute_sql("SHOW TABLES")
         table_count = len(tables_result.rows) if tables_result.rows else 0
 
-        return (
+        info = (
             f"Database: {db}\n"
             f"TiDB Version: {version}\n"
             f"Host: {config.host}\n"
             f"API: {config.api_url}\n"
             f"Tables: {table_count}\n"
-            f"Connection: Serverless HTTP (no persistent connections)\n"
+            f"Connection: Serverless HTTP (stateless, no driver needed)\n"
+        )
+        if config.expires_at:
+            info += f"Instance expires: {config.expires_at}\n"
+        info += (
             f"\nTiDB Cloud Zero — Free serverless MySQL for AI agents.\n"
             f"Get yours at https://zero.tidbcloud.com"
         )
+        return info
     except Exception as e:
         return f"Error: {e}"
 
@@ -349,12 +442,7 @@ async def resource_info() -> str:
 
 @mcp.prompt()
 def create_crud_table(table_name: str, columns: str) -> str:
-    """Generate SQL to create a table with common CRUD patterns.
-
-    Args:
-        table_name: Name of the table
-        columns: Comma-separated column definitions (e.g., "name VARCHAR(255), age INT")
-    """
+    """Generate SQL to create a table with common CRUD patterns."""
     return f"""Please create a table called `{table_name}` with these columns: {columns}
 
 Also add:
@@ -375,8 +463,7 @@ def analyze_data(table_name: str) -> str:
 2. Use query("SELECT COUNT(*) as total FROM {table_name}") for row count
 3. For numeric columns, calculate min, max, avg
 4. For text columns, show distinct value counts
-5. Look for any interesting patterns or anomalies
-6. Summarize your findings"""
+5. Summarize your findings"""
 
 
 if __name__ == "__main__":
